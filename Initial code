@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+ti_fem_simulation.py
+====================
+Run and post‑process a 4‑electrode Temporal‑Interference (TI) finite‑element simulation in
+**SimNIBS 4.5.0** using the built‑in *Ernie* head model.
+
+• Builds a SESSION with two TDCSLIST objects (left F5–P5, right F6–P6).
+• Executes the quasi‑static FEM solver (GetDP) once per electrode pair.
+• Combines the two electric‑field solutions into a beat‑frequency envelope map
+  (E_mod) representing the maximum low‑frequency modulation amplitude.
+• Reports how much gray‑matter volume exceeds the neuromodulatory threshold
+  (default 0.2 V/m).  
+• Saves a self‑contained *.msh* file containing the envelope field that can be
+  opened in the SimNIBS GUI, Gmsh, or converted to NIfTI for further analysis.
+
+Run from the command line (inside the SimNIBS Python environment) with e.g.:
+    python ti_fem_simulation.py --head m2m_ernie --out TI_results --current 1.0
+
+Requirements
+------------
+* SimNIBS ≥ 4.5.0 (convenient to activate with `source ~/simnibs_env/bin/activate`)
+* NumPy (bundled with SimNIBS)
+* Python 3.8+
+
+Author: Dr Aazil Naseer <github.com/aazil‑naseer>
+Date: 24 Apr 2025
+"""
+from __future__ import annotations
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+from simnibs import sim_struct, run_simnibs  # core API
+from simnibs.utils import mesh_io as mio     # mesh helpers
+from simnibs.utils import ti as ti_utils     # TI envelope helper
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def build_session(head_dir: str | Path,
+                  out_dir: str | Path,
+                  current: float = 1.0,
+                  pad_mm: tuple[int, int] = (40, 40)) -> sim_struct.SESSION:
+    """Create a SimNIBS SESSION with two TDCSLIST objects.
+
+    Parameters
+    ----------
+    head_dir : path to the subject's *m2m* folder (e.g. *m2m_ernie*)
+    out_dir  : where simulation results are written
+    current  : peak current per electrode in mA (same for all four pads)
+    pad_mm   : (length, width) in millimetres of the rectangular/elliptical pad
+    """
+    S = sim_struct.SESSION()
+    S.subpath = str(head_dir)
+    S.pathfem = str(out_dir)
+
+    def add_pair(anode: str, cathode: str) -> None:
+        tdcs = S.add_tdcslist()
+        tdcs.currents = [current, -current]  # must sum to zero
+
+        e_an = tdcs.add_electrode()
+        e_an.centre = anode
+        e_an.shape = 'ellipse'
+        e_an.dimensions = list(pad_mm)
+        e_an.thickness = 2  # mm
+        e_an.channelnr = 1
+
+        e_cat = tdcs.add_electrode()
+        e_cat.centre = cathode
+        e_cat.shape = 'ellipse'
+        e_cat.dimensions = list(pad_mm)
+        e_cat.thickness = 2
+        e_cat.channelnr = 2
+
+    # Pair 1 – left temporal axis
+    add_pair('F5', 'P5')
+    # Pair 2 – right temporal axis (mirrored)
+    add_pair('F6', 'P6')
+
+    return S
+
+
+def combine_envelope(out_dir: str | Path,
+                     base_name: str = 'ernie',
+                     target_thr: float = 0.2,
+                     gm_region_idx: tuple[int, ...] = (2,)) -> Path:
+    """Load the two solved E‑fields, compute max TI envelope, save combined mesh.
+
+    Parameters
+    ----------
+    out_dir     : directory where SimNIBS wrote FEM results
+    base_name   : subject name prefix used by SimNIBS (e.g. 'ernie')
+    target_thr  : activation threshold in V/m (for reporting only)
+    gm_region_idx : region indices corresponding to cortical gray matter
+
+    Returns
+    -------
+    Path to the saved envelope *.msh* file.
+    """
+
+    # Load scalar meshes from each TDCS simulation
+    msh1 = mio.mesh_load_gmsh4(Path(out_dir) / f'{base_name}_TDCS_1_scalar.msh')
+    msh2 = mio.mesh_load_gmsh4(Path(out_dir) / f'{base_name}_TDCS_2_scalar.msh')
+
+    # Strip out electrode elements (>1000) so element counts match
+    keep = [idx for idx in set(mio.get_region_list(msh1)) if idx < 1000]
+    msh1 = mio.mesh_extract_regions(msh1, region_idx=keep)
+    msh2 = mio.mesh_extract_regions(msh2, region_idx=keep)
+
+    # Retrieve E‑field (vector) from each mesh
+    e_idx_1 = mio.get_field_idx(msh1, 'E', 'elem')
+    e_idx_2 = mio.get_field_idx(msh2, 'E', 'elem')
+
+    e_field_1 = msh1.element_data[e_idx_1].tetdata
+    e_field_2 = msh2.element_data[e_idx_2].tetdata
+
+    # Compute maximum envelope amplitude per tetra
+    env_data = ti_utils.get_maxTI(e_field_1, e_field_2)
+    env_data.name = 'E_mod_envelope'
+
+    # Attach to a copy of mesh 1 for convenience and save
+    msh_out = msh1
+    msh_out.element_data.append(env_data)
+    out_path = Path(out_dir) / f'{base_name}_TI_envelope.msh'
+    mio.mesh_save_gmsh4(msh_out, out_path)
+
+    # Quick focality report in gray matter
+    gm_mask = np.isin(msh_out.mat.elem_region, gm_region_idx)
+    gm_env  = env_data.tetdata[gm_mask]
+    frac = np.mean(gm_env >= target_thr)
+    print(f"Gray‑matter volume with E_mod ≥ {target_thr:.2f} V/m: {frac*100:.2f}%")
+
+    return out_path
+
+
+# -----------------------------------------------------------------------------
+# CLI entry point
+# -----------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Run a 4‑electrode Temporal‑Interference FEM simulation in SimNIBS')
+    parser.add_argument('--head', default='m2m_ernie',
+                        help='Path to subject *m2m* folder (default: built‑in Ernie)')
+    parser.add_argument('--out',  default='TI_results', help='Output directory')
+    parser.add_argument('--current', type=float, default=1.0,
+                        help='Peak current per electrode in mA (default 1.0)')
+    parser.add_argument('--thr',    type=float, default=0.2,
+                        help='Activation threshold in V/m for reporting (default 0.2)')
+    args = parser.parse_args()
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print('\n=== Building SimNIBS SESSION ===')
+    S = build_session(args.head, out_dir, current=args.current)
+
+    print('=== Running FEM solver (GetDP) ===')
+    run_simnibs(S)
+
+    print('=== Combining solutions into TI envelope ===')
+    m_out = combine_envelope(out_dir, base_name='ernie', target_thr=args.thr)
+    print(f'Envelope mesh written to: {m_out}')
+
+    print('\nDone! Open the .msh in SimNIBS GUI or Gmsh for visual inspection.')
+
+
+if __name__ == '__main__':
+    main()
